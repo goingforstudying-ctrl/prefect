@@ -604,6 +604,31 @@ async def ephemeral_subscription(
     group_name = group or f"ephemeral-{socket.gethostname()}-{uuid.uuid4().hex}"
     redis_client: Redis = get_async_redis_client()
 
+    # Clean up leaked ephemeral groups from previous ungraceful shutdowns
+    # on this host before creating a new one (see #22136). Only applies
+    # when the group name is auto-generated (not user-provided).
+    if not group:
+        try:
+            groups_info = await redis_client.xinfo_groups(source)
+            host_prefix = f"ephemeral-{socket.gethostname()}-"
+            for grp in groups_info:
+                if grp.get("name", "").startswith(host_prefix):
+                    try:
+                        consumers = await redis_client.xinfo_consumers(
+                            source, grp["name"]
+                        )
+                    except Exception:
+                        consumers = []
+                    if not consumers:
+                        logger.info(
+                            "Cleaning up leaked ephemeral group '%s' on "
+                            "stream '%s' during subscription startup",
+                            grp["name"], source,
+                        )
+                        await redis_client.xgroup_destroy(source, grp["name"])
+        except Exception:
+            pass
+
     await redis_client.xgroup_create(source, group_name, id="0", mkstream=True)
 
     try:
@@ -662,6 +687,16 @@ async def _trim_stream_to_lowest_delivered_id(stream_name: str) -> None:
         # Check if this group has any active (non-idle) consumers
         try:
             consumers = await redis_client.xinfo_consumers(stream_name, group["name"])
+            if not consumers and group["name"].startswith("ephemeral-"):
+                # ephemeral groups with zero consumers are leaked from
+                # ungraceful shutdowns. Clean them up so they don't
+                # pin the stream and prevent trimming (see #22136).
+                logger.info(
+                    "Cleaning up leaked ephemeral consumer group '%s' "
+                    "on stream '%s'", group["name"], stream_name
+                )
+                await redis_client.xgroup_destroy(stream_name, group["name"])
+                continue
             if consumers and all(
                 consumer["idle"] > idle_threshold_ms for consumer in consumers
             ):

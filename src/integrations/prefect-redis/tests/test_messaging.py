@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+import socket
 import uuid
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -19,6 +21,7 @@ from prefect_redis.messaging import (
     StopConsumer,
     _cleanup_empty_consumer_groups,
     _trim_stream_to_lowest_delivered_id,
+    ephemeral_subscription,
 )
 from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -885,3 +888,74 @@ async def test_orphan_entries_acked_when_auto_ack_disabled(
     assert orphan_id in acked_ids, (
         "Orphan entry should be acked even with automatically_acknowledge=False"
     )
+
+
+async def test_trim_cleans_up_leaked_ephemeral_groups(
+    redis_client: Redis, caplog
+):
+    """Leaked ephemeral consumer groups (zero consumers) should be cleaned
+    up during trimming and not block the stream trim."""
+    stream = f"test-leaked-group-{uuid.uuid4().hex}"
+
+    # Create an ephemeral-style group with zero consumers (simulating a leak)
+    leaked_group = f"ephemeral-{socket.gethostname()}-{uuid.uuid4().hex}"
+    await redis_client.xgroup_create(stream, leaked_group, id="0", mkstream=True)
+
+    # Create a healthy group with an active consumer
+    healthy_group = f"healthy-{uuid.uuid4().hex}"
+    await redis_client.xgroup_create(stream, healthy_group, id="0", mkstream=True)
+    consumer = redis_client
+    await redis_client.xreadgroup(
+        healthy_group, "consumer-1", {stream: ">"}, count=1, block=100
+    )
+    # Add a message and consume it
+    msg_id = await redis_client.xadd(stream, {"key": "value"})
+    results = await redis_client.xreadgroup(
+        healthy_group, "consumer-1", {stream: ">"}, count=1, block=1000
+    )
+    if results:
+        await redis_client.xack(stream, healthy_group, msg_id)
+
+    # Run trimming — the leaked group should be cleaned up
+    with caplog.at_level(logging.INFO):
+        await _trim_stream_to_lowest_delivered_id(stream)
+
+    assert any("Cleaning up leaked ephemeral" in r.message for r in caplog.records)
+
+    # Verify the leaked group was actually destroyed
+    groups_after = await redis_client.xinfo_groups(stream)
+    group_names = {g["name"] for g in groups_after}
+    assert leaked_group not in group_names, "Leaked group should be cleaned up"
+    assert healthy_group in group_names
+
+
+async def test_ephemeral_subscription_cleans_leaked_groups(
+    redis_client: Redis, caplog
+):
+    """Creating a new ephemeral subscription should clean up leaked groups
+    from the same host on the same stream."""
+    stream = "test-ephemeral-cleanup"
+    host_prefix = f"ephemeral-{socket.gethostname()}-"
+
+    # Seed a leaked group with zero consumers
+    leaked_group = f"{host_prefix}{uuid.uuid4().hex}"
+    await redis_client.xgroup_create(stream, leaked_group, id="0", mkstream=True)
+
+    # Also seed an active group that should NOT be cleaned
+    active_group = f"{host_prefix}{uuid.uuid4().hex}"
+    await redis_client.xgroup_create(stream, active_group, id="0", mkstream=True)
+    # Create a consumer to make it "active"
+    await redis_client.xgroup_createconsumer(stream, active_group, "worker-1")
+
+    with caplog.at_level(logging.INFO):
+        async with ephemeral_subscription(stream) as consumer_kwargs:
+            assert consumer_kwargs["topic"] == stream
+
+    # Leaked group should be gone, active group should remain
+    groups_after = await redis_client.xinfo_groups(stream)
+    group_names = {g["name"] for g in groups_after}
+    assert leaked_group not in group_names, "Leaked group should be cleaned up"
+    assert active_group in group_names, "Active group should NOT be cleaned"
+
+    # The subscription's own group should have been cleaned on exit
+    assert consumer_kwargs["group"] not in group_names
